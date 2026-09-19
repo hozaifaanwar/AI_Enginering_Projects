@@ -2,16 +2,42 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { KanbanBoard } from "@/components/KanbanBoard";
 
+const login = async () => {
+  await userEvent.type(screen.getByLabelText(/username/i), "user");
+  await userEvent.type(screen.getByLabelText(/password/i), "password");
+  await userEvent.click(screen.getByRole("button", { name: /sign in/i }));
+};
+
 const getFirstColumn = () => screen.getAllByTestId(/column-/i)[0];
 
 describe("KanbanBoard", () => {
-  it("renders five columns", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("requires login before showing the board", () => {
     render(<KanbanBoard />);
+    expect(screen.getByRole("heading", { name: /sign in/i })).toBeInTheDocument();
+    expect(screen.queryByText("Kanban Studio")).not.toBeInTheDocument();
+  });
+
+  it("shows an error for invalid credentials", async () => {
+    render(<KanbanBoard />);
+    await userEvent.type(screen.getByLabelText(/username/i), "wrong");
+    await userEvent.type(screen.getByLabelText(/password/i), "credentials");
+    await userEvent.click(screen.getByRole("button", { name: /sign in/i }));
+    expect(screen.getByText(/invalid credentials/i)).toBeInTheDocument();
+  });
+
+  it("renders five columns", async () => {
+    render(<KanbanBoard />);
+    await login();
     expect(screen.getAllByTestId(/column-/i)).toHaveLength(5);
   });
 
   it("renames a column", async () => {
     render(<KanbanBoard />);
+    await login();
     const column = getFirstColumn();
     const input = within(column).getByLabelText("Column title");
     await userEvent.clear(input);
@@ -21,6 +47,7 @@ describe("KanbanBoard", () => {
 
   it("adds and removes a card", async () => {
     render(<KanbanBoard />);
+    await login();
     const column = getFirstColumn();
     const addButton = within(column).getByRole("button", {
       name: /add a card/i,
@@ -42,5 +69,12 @@ describe("KanbanBoard", () => {
     await userEvent.click(deleteButton);
 
     expect(within(column).queryByText("New card")).not.toBeInTheDocument();
+  });
+
+  it("allows logout", async () => {
+    render(<KanbanBoard />);
+    await login();
+    await userEvent.click(screen.getByRole("button", { name: /log out/i }));
+    expect(screen.getByRole("heading", { name: /sign in/i })).toBeInTheDocument();
   });
 });
