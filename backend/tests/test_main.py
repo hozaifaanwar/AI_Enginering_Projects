@@ -8,11 +8,18 @@ from fastapi.testclient import TestClient
 from app.main import AIPingResponse, AIChatLLMOutput, create_app, normalize_chat_output
 
 
+AUTH_HEADERS = {
+    "X-Demo-User": "user",
+    "X-Demo-Password": "password",
+}
+
+
 @pytest.fixture()
 def client(tmp_path: Path) -> TestClient:
     db_path = tmp_path / "pm-test.sqlite"
     app = create_app(db_path=db_path, frontend_dist=tmp_path / "missing-frontend")
     with TestClient(app) as test_client:
+        test_client.headers.update(AUTH_HEADERS)
         yield test_client
 
 
@@ -34,17 +41,50 @@ def test_get_board_seeds_default_data(client: TestClient) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["username"] == "user"
+    assert payload["revision"] >= 1
     assert len(payload["board"]["columns"]) == 5
     assert "card-1" in payload["board"]["cards"]
 
 
+def test_get_board_requires_auth(tmp_path: Path) -> None:
+    db_path = tmp_path / "unauthorized.sqlite"
+    app = create_app(db_path=db_path, frontend_dist=tmp_path / "missing-frontend")
+    with TestClient(app) as unauth_client:
+        response = unauth_client.get("/api/board")
+    assert response.status_code == 401
+
+
 def test_put_board_replaces_board(client: TestClient) -> None:
-    current = client.get("/api/board").json()["board"]
+    current_payload = client.get("/api/board").json()
+    current_revision = current_payload["revision"]
+    current = current_payload["board"]
     current["columns"][0]["title"] = "Renamed from PUT"
 
-    response = client.put("/api/board", json={"username": "user", "board": current})
+    response = client.put(
+        "/api/board",
+        json={"username": "user", "revision": current_revision, "board": current},
+    )
     assert response.status_code == 200
     assert response.json()["board"]["columns"][0]["title"] == "Renamed from PUT"
+
+
+def test_put_board_rejects_stale_revision(client: TestClient) -> None:
+    initial = client.get("/api/board").json()
+    stale_revision = initial["revision"]
+    board = initial["board"]
+
+    first = client.put(
+        "/api/board",
+        json={"username": "user", "revision": stale_revision, "board": board},
+    )
+    assert first.status_code == 200
+
+    board["columns"][0]["title"] = "Conflict write"
+    second = client.put(
+        "/api/board",
+        json={"username": "user", "revision": stale_revision, "board": board},
+    )
+    assert second.status_code == 409
 
 
 def test_operations_endpoint_applies_mutations(client: TestClient) -> None:
@@ -76,10 +116,12 @@ def test_operations_endpoint_applies_mutations(client: TestClient) -> None:
 
 
 def create_movable_card(client: TestClient) -> str:
+    revision = client.get("/api/board").json()["revision"]
     add_response = client.post(
         "/api/board/operations",
         json={
             "username": "user",
+            "revision": revision,
             "operations": [
                 {
                     "type": "add_card",
@@ -99,11 +141,13 @@ def create_movable_card(client: TestClient) -> str:
 
 def test_operations_update_and_move_card(client: TestClient) -> None:
     movable_card_id = create_movable_card(client)
+    revision = client.get("/api/board").json()["revision"]
 
     update_move_response = client.post(
         "/api/board/operations",
         json={
             "username": "user",
+            "revision": revision,
             "operations": [
                 {
                     "type": "update_card",
@@ -129,11 +173,13 @@ def test_operations_update_and_move_card(client: TestClient) -> None:
 
 def test_operations_delete_card(client: TestClient) -> None:
     movable_card_id = create_movable_card(client)
+    revision = client.get("/api/board").json()["revision"]
 
     delete_response = client.post(
         "/api/board/operations",
         json={
             "username": "user",
+            "revision": revision,
             "operations": [{"type": "delete_card", "cardId": movable_card_id}],
         },
     )
@@ -147,9 +193,15 @@ def test_db_file_created_and_persists_board(tmp_path: Path) -> None:
     app = create_app(db_path=db_path, frontend_dist=tmp_path / "missing-frontend")
 
     with TestClient(app) as first_client:
-        initial = first_client.get("/api/board").json()["board"]
+        first_client.headers.update(AUTH_HEADERS)
+        initial_payload = first_client.get("/api/board").json()
+        initial_revision = initial_payload["revision"]
+        initial = initial_payload["board"]
         initial["columns"][0]["title"] = "Persisted Title"
-        save = first_client.put("/api/board", json={"username": "user", "board": initial})
+        save = first_client.put(
+            "/api/board",
+            json={"username": "user", "revision": initial_revision, "board": initial},
+        )
         assert save.status_code == 200
 
     assert db_path.exists()
@@ -160,15 +212,21 @@ def test_db_file_created_and_persists_board(tmp_path: Path) -> None:
         assert row[0] == 1
 
     with TestClient(app) as second_client:
+        second_client.headers.update(AUTH_HEADERS)
         persisted = second_client.get("/api/board").json()["board"]
         assert persisted["columns"][0]["title"] == "Persisted Title"
 
 
 def test_invalid_board_rejected(client: TestClient) -> None:
-    invalid_board = client.get("/api/board").json()["board"]
+    current = client.get("/api/board").json()
+    invalid_board = current["board"]
+    revision = current["revision"]
     invalid_board["columns"][0]["cardIds"].append("missing-card")
 
-    response = client.put("/api/board", json={"username": "user", "board": invalid_board})
+    response = client.put(
+        "/api/board",
+        json={"username": "user", "revision": revision, "board": invalid_board},
+    )
     assert response.status_code == 422
 
 
@@ -191,6 +249,7 @@ def test_ai_ping_missing_api_key(client: TestClient, monkeypatch: pytest.MonkeyP
 
 
 def test_ai_chat_without_board_updates(client: TestClient) -> None:
+    revision = client.get("/api/board").json()["revision"]
     with patch(
         "app.main.request_openrouter_kanban_response",
         return_value=AIChatLLMOutput(
@@ -202,6 +261,7 @@ def test_ai_chat_without_board_updates(client: TestClient) -> None:
             "/api/ai/chat",
             json={
                 "username": "user",
+                "revision": revision,
                 "message": "Do I need to move anything?",
                 "history": [{"role": "user", "content": "status check"}],
             },
@@ -215,6 +275,7 @@ def test_ai_chat_without_board_updates(client: TestClient) -> None:
 
 
 def test_ai_chat_with_board_update_persists(client: TestClient) -> None:
+    revision = client.get("/api/board").json()["revision"]
     with patch(
         "app.main.request_openrouter_kanban_response",
         return_value=AIChatLLMOutput(
@@ -232,6 +293,7 @@ def test_ai_chat_with_board_update_persists(client: TestClient) -> None:
             "/api/ai/chat",
             json={
                 "username": "user",
+                "revision": revision,
                 "message": "Rename backlog to ideas",
                 "history": [],
             },
@@ -247,6 +309,34 @@ def test_ai_chat_with_board_update_persists(client: TestClient) -> None:
     verify = client.get("/api/board?username=user")
     assert verify.status_code == 200
     assert verify.json()["board"]["columns"][0]["title"] == "Ideas"
+
+
+def test_ai_chat_infers_add_card_when_operations_missing(client: TestClient) -> None:
+    revision = client.get("/api/board").json()["revision"]
+    title = "Inferred Backend Card"
+
+    with patch(
+        "app.main.request_openrouter_kanban_response",
+        return_value=AIChatLLMOutput(
+            assistantResponse=f"Added card '{title}' to backlog.",
+            operations=[],
+        ),
+    ):
+        response = client.post(
+            "/api/ai/chat",
+            json={
+                "username": "user",
+                "revision": revision,
+                "message": f"Add one card to col-backlog titled '{title}' with details 'from fallback'.",
+                "history": [],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["boardUpdated"] is True
+    assert payload["operationsApplied"] == 1
+    assert any(card["title"] == title for card in payload["board"]["cards"].values())
 
 
 def test_normalize_chat_output_accepts_snake_case_operations() -> None:

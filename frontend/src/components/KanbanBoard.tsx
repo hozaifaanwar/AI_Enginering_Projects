@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -19,6 +19,10 @@ import { createId, initialData, moveCard, type BoardData } from "@/lib/kanban";
 const AUTH_STORAGE_KEY = "pm-authenticated";
 const MVP_USERNAME = "user";
 const MVP_PASSWORD = "password";
+const DEMO_AUTH_HEADERS = {
+  "X-Demo-User": MVP_USERNAME,
+  "X-Demo-Password": MVP_PASSWORD,
+};
 
 export const KanbanBoard = () => {
   const [board, setBoard] = useState<BoardData>(() => initialData);
@@ -37,6 +41,7 @@ export const KanbanBoard = () => {
   ]);
   const [chatError, setChatError] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
+  const boardRevisionRef = useRef(1);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -64,19 +69,38 @@ export const KanbanBoard = () => {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
+          ...DEMO_AUTH_HEADERS,
         },
         body: JSON.stringify({
           username: MVP_USERNAME,
+          revision: boardRevisionRef.current,
           board: nextBoard,
         }),
       });
+
+      if (response.status === 409) {
+        const latest = await fetch(`/api/board?username=${MVP_USERNAME}`, {
+          headers: DEMO_AUTH_HEADERS,
+        });
+        if (latest.ok) {
+          const latestPayload = (await latest.json()) as {
+            board: BoardData;
+            revision: number;
+          };
+          setBoard(latestPayload.board);
+          boardRevisionRef.current = latestPayload.revision;
+          setSyncMessage("Detected concurrent change. Reloaded latest board.");
+        }
+        return;
+      }
 
       if (!response.ok) {
         throw new Error(`Persist failed with status ${response.status}`);
       }
 
-      const payload = (await response.json()) as { board: BoardData };
+      const payload = (await response.json()) as { board: BoardData; revision: number };
       setBoard(payload.board);
+      boardRevisionRef.current = payload.revision;
       setSyncMessage("");
     } catch {
       setSyncMessage("Working locally. Backend sync is currently unavailable.");
@@ -94,9 +118,11 @@ export const KanbanBoard = () => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          ...DEMO_AUTH_HEADERS,
         },
         body: JSON.stringify({
           username: MVP_USERNAME,
+          revision: boardRevisionRef.current,
           message,
           history: nextMessages,
         }),
@@ -109,6 +135,7 @@ export const KanbanBoard = () => {
       const payload = (await response.json()) as {
         assistantResponse: string;
         boardUpdated: boolean;
+        revision: number;
         board: BoardData;
       };
 
@@ -121,6 +148,7 @@ export const KanbanBoard = () => {
         setBoard(payload.board);
         setSyncMessage("Board updated by AI.");
       }
+      boardRevisionRef.current = payload.revision;
     } catch {
       setChatError("AI request failed. Please try again.");
       setChatMessages((prev) => [
@@ -144,13 +172,16 @@ export const KanbanBoard = () => {
 
     const loadBoard = async () => {
       try {
-        const response = await fetch(`/api/board?username=${MVP_USERNAME}`);
+        const response = await fetch(`/api/board?username=${MVP_USERNAME}`, {
+          headers: DEMO_AUTH_HEADERS,
+        });
         if (!response.ok) {
           throw new Error(`Load failed with status ${response.status}`);
         }
-        const payload = (await response.json()) as { board: BoardData };
+        const payload = (await response.json()) as { board: BoardData; revision: number };
         if (!cancelled) {
           setBoard(payload.board);
+          boardRevisionRef.current = payload.revision;
           setSyncMessage("");
         }
       } catch {

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Annotated, Literal, Union
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
@@ -55,11 +56,13 @@ class BoardDataModel(BaseModel):
 
 class BoardResponse(BaseModel):
   username: str
+  revision: int
   board: BoardDataModel
 
 
 class PutBoardRequest(BaseModel):
   username: str = "user"
+  revision: int | None = None
   board: BoardDataModel
 
 
@@ -109,6 +112,7 @@ BoardOperation = Annotated[
 
 class ApplyOperationsRequest(BaseModel):
   username: str = "user"
+  revision: int | None = None
   operations: list[BoardOperation]
 
 
@@ -128,6 +132,7 @@ class AIConversationMessage(BaseModel):
 
 class AIChatRequest(BaseModel):
   username: str = "user"
+  revision: int | None = None
   message: str
   history: list[AIConversationMessage] = Field(default_factory=list)
 
@@ -141,7 +146,20 @@ class AIChatResponse(BaseModel):
   assistantResponse: str
   boardUpdated: bool
   operationsApplied: int
+  revision: int
   board: BoardDataModel
+
+
+DEMO_USER_HEADER = "X-Demo-User"
+DEMO_PASSWORD_HEADER = "X-Demo-Password"
+
+
+def enforce_demo_auth(
+  user: str | None = Header(default=None, alias=DEMO_USER_HEADER),
+  password: str | None = Header(default=None, alias=DEMO_PASSWORD_HEADER),
+) -> None:
+  if user != "user" or password != "password":
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 DEFAULT_BOARD: dict = {
@@ -235,6 +253,7 @@ def init_database(db_path: Path) -> None:
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL UNIQUE,
         board_json TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
         schema_version INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -245,6 +264,12 @@ def init_database(db_path: Path) -> None:
       CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
       """
     )
+
+    # Migration for older local databases created before revision support.
+    columns = connection.execute("PRAGMA table_info(boards)").fetchall()
+    existing_columns = {column[1] for column in columns}
+    if "revision" not in existing_columns:
+      connection.execute("ALTER TABLE boards ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
 
 
 def ensure_user_and_board(connection: sqlite3.Connection, username: str) -> int:
@@ -268,8 +293,8 @@ def ensure_user_and_board(connection: sqlite3.Connection, username: str) -> int:
   if existing_board is None:
     connection.execute(
       """
-      INSERT INTO boards (user_id, board_json, schema_version)
-      VALUES (?, ?, 1)
+      INSERT INTO boards (user_id, board_json, revision, schema_version)
+      VALUES (?, ?, 1, 1)
       """,
       (user_id, default_board_model().model_dump_json()),
     )
@@ -277,29 +302,55 @@ def ensure_user_and_board(connection: sqlite3.Connection, username: str) -> int:
   return user_id
 
 
-def load_board(connection: sqlite3.Connection, username: str) -> BoardDataModel:
+def load_board(connection: sqlite3.Connection, username: str) -> tuple[BoardDataModel, int]:
   user_id = ensure_user_and_board(connection, username)
   row = connection.execute(
-    "SELECT board_json FROM boards WHERE user_id = ?",
+    "SELECT board_json, revision FROM boards WHERE user_id = ?",
     (user_id,),
   ).fetchone()
   if row is None:
     raise RuntimeError(f"No board found for username '{username}'.")
 
   board_data = json.loads(row["board_json"])
-  return BoardDataModel.model_validate(board_data)
+  revision = int(row["revision"])
+  return BoardDataModel.model_validate(board_data), revision
 
 
-def save_board(connection: sqlite3.Connection, username: str, board: BoardDataModel) -> None:
+def save_board(
+  connection: sqlite3.Connection,
+  username: str,
+  board: BoardDataModel,
+  expected_revision: int | None = None,
+) -> int:
   user_id = ensure_user_and_board(connection, username)
-  connection.execute(
-    """
-    UPDATE boards
-    SET board_json = ?, schema_version = 1, updated_at = CURRENT_TIMESTAMP
-    WHERE user_id = ?
-    """,
-    (board.model_dump_json(), user_id),
-  )
+  if expected_revision is None:
+    connection.execute(
+      """
+      UPDATE boards
+      SET board_json = ?, revision = revision + 1, schema_version = 1, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = ?
+      """,
+      (board.model_dump_json(), user_id),
+    )
+  else:
+    cursor = connection.execute(
+      """
+      UPDATE boards
+      SET board_json = ?, revision = revision + 1, schema_version = 1, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = ? AND revision = ?
+      """,
+      (board.model_dump_json(), user_id, expected_revision),
+    )
+    if cursor.rowcount == 0:
+      raise HTTPException(status_code=409, detail="Board has changed. Please reload latest data.")
+
+  row = connection.execute(
+    "SELECT revision FROM boards WHERE user_id = ?",
+    (user_id,),
+  ).fetchone()
+  if row is None:
+    raise RuntimeError(f"No board found for username '{username}' after save.")
+  return int(row["revision"])
 
 
 def find_column(board: BoardDataModel, column_id: str) -> ColumnModel:
@@ -539,6 +590,58 @@ def normalize_chat_output(parsed: dict) -> AIChatLLMOutput:
   )
 
 
+def infer_column_id_from_message(message: str) -> str | None:
+  lowered = message.lower()
+  explicit_column_id = re.search(r"\b(col-[a-z0-9-]+)\b", lowered)
+  if explicit_column_id:
+    return explicit_column_id.group(1)
+
+  keyword_map = {
+    "backlog": "col-backlog",
+    "discovery": "col-discovery",
+    "in progress": "col-progress",
+    "progress": "col-progress",
+    "review": "col-review",
+    "done": "col-done",
+  }
+  for keyword, column_id in keyword_map.items():
+    if keyword in lowered:
+      return column_id
+  return None
+
+
+def infer_operations_from_message(message: str) -> list[dict]:
+  lowered = message.lower()
+  if "add" not in lowered or "card" not in lowered:
+    return []
+
+  column_id = infer_column_id_from_message(message)
+  if column_id is None:
+    return []
+
+  title_match = re.search(r"titled\s+['\"]([^'\"]+)['\"]", message, flags=re.IGNORECASE)
+  if title_match is None:
+    title_match = re.search(r"title\s+['\"]([^'\"]+)['\"]", message, flags=re.IGNORECASE)
+  if title_match is None:
+    return []
+
+  details_match = re.search(
+    r"details\s+['\"]([^'\"]+)['\"]",
+    message,
+    flags=re.IGNORECASE,
+  )
+  details = details_match.group(1) if details_match else "No details yet."
+
+  return [
+    {
+      "type": "add_card",
+      "columnId": column_id,
+      "title": title_match.group(1),
+      "details": details,
+    }
+  ]
+
+
 def request_openrouter_kanban_response(
   board: BoardDataModel,
   message: str,
@@ -655,55 +758,85 @@ def create_app(db_path: Path | None = None, frontend_dist: Path | None = None) -
     return {"status": "ok", "service": "pm-backend"}
 
   @app.get("/api/board", response_model=BoardResponse)
-  def get_board(username: str = "user") -> BoardResponse:
+  def get_board(username: str = "user", _: None = Depends(enforce_demo_auth)) -> BoardResponse:
     with get_connection(resolved_db_path) as connection:
-      board = load_board(connection, username)
-      return BoardResponse(username=username, board=board)
+      board, revision = load_board(connection, username)
+      return BoardResponse(username=username, revision=revision, board=board)
 
   @app.put("/api/board", response_model=BoardResponse)
-  def put_board(payload: PutBoardRequest) -> BoardResponse:
+  def put_board(payload: PutBoardRequest, _: None = Depends(enforce_demo_auth)) -> BoardResponse:
     with get_connection(resolved_db_path) as connection:
-      save_board(connection, payload.username, payload.board)
-      board = load_board(connection, payload.username)
-      return BoardResponse(username=payload.username, board=board)
+      revision = save_board(
+        connection,
+        payload.username,
+        payload.board,
+        expected_revision=payload.revision,
+      )
+      board, _ = load_board(connection, payload.username)
+      return BoardResponse(username=payload.username, revision=revision, board=board)
 
   @app.post("/api/board/operations", response_model=BoardResponse)
-  def apply_board_operations(payload: ApplyOperationsRequest) -> BoardResponse:
+  def apply_board_operations(
+    payload: ApplyOperationsRequest,
+    _: None = Depends(enforce_demo_auth),
+  ) -> BoardResponse:
     with get_connection(resolved_db_path) as connection:
-      board = load_board(connection, payload.username)
+      board, current_revision = load_board(connection, payload.username)
       for operation in payload.operations:
         board = apply_operation(board, operation)
       # Re-validate invariants before persisting.
       board = BoardDataModel.model_validate(board.model_dump())
-      save_board(connection, payload.username, board)
-      return BoardResponse(username=payload.username, board=board)
+      revision = save_board(
+        connection,
+        payload.username,
+        board,
+        expected_revision=payload.revision if payload.revision is not None else current_revision,
+      )
+      return BoardResponse(username=payload.username, revision=revision, board=board)
 
   @app.post("/api/ai/ping", response_model=AIPingResponse)
-  def ai_ping(payload: AIPingRequest) -> AIPingResponse:
+  def ai_ping(payload: AIPingRequest, _: None = Depends(enforce_demo_auth)) -> AIPingResponse:
     return request_openrouter_completion(payload.question)
 
   @app.post("/api/ai/chat", response_model=AIChatResponse)
-  def ai_chat(payload: AIChatRequest) -> AIChatResponse:
+  def ai_chat(payload: AIChatRequest, _: None = Depends(enforce_demo_auth)) -> AIChatResponse:
     with get_connection(resolved_db_path) as connection:
-      board = load_board(connection, payload.username)
+      board, current_revision = load_board(connection, payload.username)
       llm_output = request_openrouter_kanban_response(
         board=board,
         message=payload.message,
         history=payload.history,
       )
 
+      if not llm_output.operations:
+        inferred_operations = infer_operations_from_message(payload.message)
+        if inferred_operations:
+          llm_output = AIChatLLMOutput.model_validate(
+            {
+              "assistantResponse": llm_output.assistantResponse,
+              "operations": inferred_operations,
+            }
+          )
+
       for operation in llm_output.operations:
         board = apply_operation(board, operation)
 
       board = BoardDataModel.model_validate(board.model_dump())
       board_updated = len(llm_output.operations) > 0
+      revision = current_revision
       if board_updated:
-        save_board(connection, payload.username, board)
+        revision = save_board(
+          connection,
+          payload.username,
+          board,
+          expected_revision=payload.revision if payload.revision is not None else current_revision,
+        )
 
       return AIChatResponse(
         assistantResponse=llm_output.assistantResponse,
         boardUpdated=board_updated,
         operationsApplied=len(llm_output.operations),
+        revision=revision,
         board=board,
       )
 

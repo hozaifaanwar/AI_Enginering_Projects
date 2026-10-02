@@ -6,5 +6,10 @@ services:
     container_name: pm-mvp
     ports:
       - "8000:8000"
+    volumes:
+      - pm_data:/app/backend/data
     env_file:
       - .env
+
+volumes:
+  pm_data:

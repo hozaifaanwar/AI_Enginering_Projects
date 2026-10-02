@@ -11,6 +11,7 @@
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
     "test:e2e": "playwright test",
+    "test:e2e:integrated": "playwright test -c playwright.integrated.config.ts",
     "test:all": "npm run test:unit && npm run test:e2e"
   },
   "dependencies": {
