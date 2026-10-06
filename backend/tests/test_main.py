@@ -3,9 +3,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import AIPingResponse, AIChatLLMOutput, create_app, normalize_chat_output
+from app.main import (
+    AIChatLLMOutput,
+    AIPingResponse,
+    BoardDataModel,
+    create_app,
+    request_openrouter_kanban_response,
+    save_board,
+)
 
 
 AUTH_HEADERS = {
@@ -62,7 +70,7 @@ def test_put_board_replaces_board(client: TestClient) -> None:
 
     response = client.put(
         "/api/board",
-        json={"username": "user", "revision": current_revision, "board": current},
+        json={"revision": current_revision, "board": current},
     )
     assert response.status_code == 200
     assert response.json()["board"]["columns"][0]["title"] == "Renamed from PUT"
@@ -75,14 +83,14 @@ def test_put_board_rejects_stale_revision(client: TestClient) -> None:
 
     first = client.put(
         "/api/board",
-        json={"username": "user", "revision": stale_revision, "board": board},
+        json={"revision": stale_revision, "board": board},
     )
     assert first.status_code == 200
 
     board["columns"][0]["title"] = "Conflict write"
     second = client.put(
         "/api/board",
-        json={"username": "user", "revision": stale_revision, "board": board},
+        json={"revision": stale_revision, "board": board},
     )
     assert second.status_code == 409
 
@@ -91,7 +99,6 @@ def test_operations_endpoint_applies_mutations(client: TestClient) -> None:
     response = client.post(
         "/api/board/operations",
         json={
-            "username": "user",
             "operations": [
                 {"type": "rename_column", "columnId": "col-backlog", "title": "Ideas"},
                 {
@@ -120,7 +127,6 @@ def create_movable_card(client: TestClient) -> str:
     add_response = client.post(
         "/api/board/operations",
         json={
-            "username": "user",
             "revision": revision,
             "operations": [
                 {
@@ -146,7 +152,6 @@ def test_operations_update_and_move_card(client: TestClient) -> None:
     update_move_response = client.post(
         "/api/board/operations",
         json={
-            "username": "user",
             "revision": revision,
             "operations": [
                 {
@@ -178,7 +183,6 @@ def test_operations_delete_card(client: TestClient) -> None:
     delete_response = client.post(
         "/api/board/operations",
         json={
-            "username": "user",
             "revision": revision,
             "operations": [{"type": "delete_card", "cardId": movable_card_id}],
         },
@@ -200,7 +204,7 @@ def test_db_file_created_and_persists_board(tmp_path: Path) -> None:
         initial["columns"][0]["title"] = "Persisted Title"
         save = first_client.put(
             "/api/board",
-            json={"username": "user", "revision": initial_revision, "board": initial},
+            json={"revision": initial_revision, "board": initial},
         )
         assert save.status_code == 200
 
@@ -225,7 +229,7 @@ def test_invalid_board_rejected(client: TestClient) -> None:
 
     response = client.put(
         "/api/board",
-        json={"username": "user", "revision": revision, "board": invalid_board},
+        json={"revision": revision, "board": invalid_board},
     )
     assert response.status_code == 422
 
@@ -248,110 +252,117 @@ def test_ai_ping_missing_api_key(client: TestClient, monkeypatch: pytest.MonkeyP
     assert response.json()["detail"] == "OPENROUTER_API_KEY is not configured."
 
 
+def post_chat_with_output(client: TestClient, output: AIChatLLMOutput, side_effect=None):
+    def fake_response(*_args, **_kwargs) -> AIChatLLMOutput:
+        if side_effect is not None:
+            side_effect()
+        return output
+
+    with patch("app.main.request_openrouter_kanban_response", side_effect=fake_response):
+        return client.post("/api/ai/chat", json={"message": "anything", "history": []})
+
+
 def test_ai_chat_without_board_updates(client: TestClient) -> None:
     revision = client.get("/api/board").json()["revision"]
-    with patch(
-        "app.main.request_openrouter_kanban_response",
-        return_value=AIChatLLMOutput(
-            assistantResponse="No board changes needed.",
-            operations=[],
-        ),
-    ):
-        response = client.post(
-            "/api/ai/chat",
-            json={
-                "username": "user",
-                "revision": revision,
-                "message": "Do I need to move anything?",
-                "history": [{"role": "user", "content": "status check"}],
-            },
-        )
+    response = post_chat_with_output(
+        client, AIChatLLMOutput(assistantResponse="No board changes needed.", operations=[])
+    )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["assistantResponse"] == "No board changes needed."
     assert payload["boardUpdated"] is False
     assert payload["operationsApplied"] == 0
+    assert payload["revision"] == revision
 
 
 def test_ai_chat_with_board_update_persists(client: TestClient) -> None:
-    revision = client.get("/api/board").json()["revision"]
-    with patch(
-        "app.main.request_openrouter_kanban_response",
-        return_value=AIChatLLMOutput(
+    response = post_chat_with_output(
+        client,
+        AIChatLLMOutput(
             assistantResponse="Renamed backlog to Ideas.",
-            operations=[
-                {
-                    "type": "rename_column",
-                    "columnId": "col-backlog",
-                    "title": "Ideas",
-                }
-            ],
+            operations=[{"type": "rename_column", "columnId": "col-backlog", "title": "Ideas"}],
         ),
-    ):
-        response = client.post(
-            "/api/ai/chat",
-            json={
-                "username": "user",
-                "revision": revision,
-                "message": "Rename backlog to ideas",
-                "history": [],
-            },
-        )
+    )
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["assistantResponse"] == "Renamed backlog to Ideas."
     assert payload["boardUpdated"] is True
     assert payload["operationsApplied"] == 1
     assert payload["board"]["columns"][0]["title"] == "Ideas"
-
-    verify = client.get("/api/board?username=user")
-    assert verify.status_code == 200
-    assert verify.json()["board"]["columns"][0]["title"] == "Ideas"
+    assert client.get("/api/board").json()["board"]["columns"][0]["title"] == "Ideas"
 
 
-def test_ai_chat_infers_add_card_when_operations_missing(client: TestClient) -> None:
-    revision = client.get("/api/board").json()["revision"]
-    title = "Inferred Backend Card"
+def test_ai_chat_does_not_lock_db_and_keeps_concurrent_edits(
+    client: TestClient, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "pm-test.sqlite"
 
-    with patch(
-        "app.main.request_openrouter_kanban_response",
-        return_value=AIChatLLMOutput(
-            assistantResponse=f"Added card '{title}' to backlog.",
-            operations=[],
+    def edit_board_during_llm_call() -> None:
+        # A short timeout fails fast if the chat request still holds a write lock.
+        connection = sqlite3.connect(db_path, timeout=0.1)
+        connection.row_factory = sqlite3.Row
+        with connection:
+            board = BoardDataModel.model_validate_json(
+                connection.execute("SELECT board_json FROM boards").fetchone()[0]
+            )
+            board.columns[1].title = "Edited during AI call"
+            save_board(connection, "user", board, None)
+        connection.close()
+
+    response = post_chat_with_output(
+        client,
+        AIChatLLMOutput(
+            assistantResponse="Renamed backlog.",
+            operations=[{"type": "rename_column", "columnId": "col-backlog", "title": "Ideas"}],
         ),
-    ):
-        response = client.post(
-            "/api/ai/chat",
-            json={
-                "username": "user",
-                "revision": revision,
-                "message": f"Add one card to col-backlog titled '{title}' with details 'from fallback'.",
-                "history": [],
-            },
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["boardUpdated"] is True
-    assert payload["operationsApplied"] == 1
-    assert any(card["title"] == title for card in payload["board"]["cards"].values())
-
-
-def test_normalize_chat_output_accepts_snake_case_operations() -> None:
-    normalized = normalize_chat_output(
-        {
-            "assistant_response": "Done.",
-            "operations": [
-                {
-                    "type": "rename_column",
-                    "column_id": "col-backlog",
-                    "title": "Ideas",
-                }
-            ],
-        }
+        side_effect=edit_board_during_llm_call,
     )
 
-    assert normalized.assistantResponse == "Done."
-    assert len(normalized.operations) == 1
+    assert response.status_code == 200
+    columns = client.get("/api/board").json()["board"]["columns"]
+    assert columns[0]["title"] == "Ideas"
+    assert columns[1]["title"] == "Edited during AI call"
+
+
+def test_ai_chat_invalid_operation_returns_502_and_keeps_board(client: TestClient) -> None:
+    before = client.get("/api/board").json()
+    response = post_chat_with_output(
+        client,
+        AIChatLLMOutput(
+            assistantResponse="Deleting.",
+            operations=[{"type": "delete_card", "cardId": "card-missing"}],
+        ),
+    )
+
+    assert response.status_code == 502
+    assert "card-missing" in response.json()["detail"]
+    assert client.get("/api/board").json() == before
+
+
+def test_username_comes_from_auth_not_request(client: TestClient, tmp_path: Path) -> None:
+    response = client.get("/api/board?username=someone-else")
+    assert response.json()["username"] == "user"
+
+    with sqlite3.connect(tmp_path / "pm-test.sqlite") as connection:
+        usernames = [row[0] for row in connection.execute("SELECT username FROM users")]
+    assert usernames == ["user"]
+
+
+def test_kanban_response_is_validated_against_schema() -> None:
+    board = BoardDataModel.model_validate(
+        {"columns": [{"id": "col-a", "title": "A", "cardIds": []}], "cards": {}}
+    )
+    valid = (
+        '{"assistantResponse": "Added.", "operations": '
+        '[{"type": "add_card", "columnId": "col-a", "title": "T", "details": "D"}]}'
+    )
+    with patch("app.main.call_openrouter", return_value=("model", valid)):
+        output = request_openrouter_kanban_response(board, "add", [])
+    assert output.operations[0].title == "T"
+
+    invalid = '{"assistantResponse": "Added.", "operations": [{"type": "add_card"}]}'
+    with patch("app.main.call_openrouter", return_value=("model", invalid)):
+        with pytest.raises(HTTPException) as error:
+            request_openrouter_kanban_response(board, "add", [])
+    assert error.value.status_code == 502

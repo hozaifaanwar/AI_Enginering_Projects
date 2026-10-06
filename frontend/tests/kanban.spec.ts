@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { mockBackend } from "./mockBackend";
 
 const signIn = async (page: import("@playwright/test").Page) => {
   await page.getByLabel("Username").fill("user");
@@ -7,6 +8,7 @@ const signIn = async (page: import("@playwright/test").Page) => {
 };
 
 test("loads the kanban board", async ({ page }) => {
+  await mockBackend(page);
   await page.goto("/");
   await signIn(page);
   await expect(page.getByRole("heading", { name: "Kanban Studio" })).toBeVisible();
@@ -14,6 +16,7 @@ test("loads the kanban board", async ({ page }) => {
 });
 
 test("adds a card to a column", async ({ page }) => {
+  await mockBackend(page);
   await page.goto("/");
   await signIn(page);
   const firstColumn = page.locator('[data-testid^="column-"]').first();
@@ -25,6 +28,7 @@ test("adds a card to a column", async ({ page }) => {
 });
 
 test("moves a card between columns", async ({ page }) => {
+  await mockBackend(page);
   await page.goto("/");
   await signIn(page);
   const card = page.getByTestId("card-card-1");
@@ -50,6 +54,7 @@ test("moves a card between columns", async ({ page }) => {
 });
 
 test("logs out and returns to sign in", async ({ page }) => {
+  await mockBackend(page);
   await page.goto("/");
   await signIn(page);
   await page.getByRole("button", { name: /log out/i }).click();
@@ -58,6 +63,7 @@ test("logs out and returns to sign in", async ({ page }) => {
 });
 
 test("shows ai sidebar and handles chat errors", async ({ page }) => {
+  await mockBackend(page);
   await page.goto("/");
   await signIn(page);
   await expect(page.getByRole("heading", { name: /ask and update/i })).toBeVisible();
@@ -65,5 +71,18 @@ test("shows ai sidebar and handles chat errors", async ({ page }) => {
     .getByPlaceholder(/example: move qa micro-interactions to done/i)
     .fill("Summarize this board");
   await page.getByRole("button", { name: /send to ai/i }).click();
-  await expect(page.getByText(/AI request failed/i)).toBeVisible();
+  await expect(page.getByText(/AI request failed. OpenRouter is unavailable./i)).toBeVisible();
+});
+
+test("edits a card", async ({ page }) => {
+  await mockBackend(page);
+  await page.goto("/");
+  await signIn(page);
+  const card = page.getByTestId("card-card-1");
+  await card.getByRole("button", { name: /edit align roadmap themes/i }).click();
+  await card.getByLabel("Card title").fill("Edited roadmap");
+  await card.getByLabel("Card details").fill("Edited in e2e.");
+  await card.getByRole("button", { name: "Save" }).click();
+  await expect(card.getByText("Edited roadmap")).toBeVisible();
+  await expect(card.getByText("Edited in e2e.")).toBeVisible();
 });

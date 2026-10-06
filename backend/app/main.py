@@ -1,8 +1,8 @@
 import json
 import os
-import re
 import sqlite3
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Annotated, Literal, Union
 from uuid import uuid4
@@ -11,7 +11,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
 class CardModel(BaseModel):
@@ -61,7 +61,6 @@ class BoardResponse(BaseModel):
 
 
 class PutBoardRequest(BaseModel):
-  username: str = "user"
   revision: int | None = None
   board: BoardDataModel
 
@@ -111,7 +110,6 @@ BoardOperation = Annotated[
 
 
 class ApplyOperationsRequest(BaseModel):
-  username: str = "user"
   revision: int | None = None
   operations: list[BoardOperation]
 
@@ -131,8 +129,6 @@ class AIConversationMessage(BaseModel):
 
 
 class AIChatRequest(BaseModel):
-  username: str = "user"
-  revision: int | None = None
   message: str
   history: list[AIConversationMessage] = Field(default_factory=list)
 
@@ -150,16 +146,19 @@ class AIChatResponse(BaseModel):
   board: BoardDataModel
 
 
+MVP_USERNAME = "user"
+MVP_PASSWORD = "password"
 DEMO_USER_HEADER = "X-Demo-User"
 DEMO_PASSWORD_HEADER = "X-Demo-Password"
 
 
-def enforce_demo_auth(
+def current_user(
   user: str | None = Header(default=None, alias=DEMO_USER_HEADER),
   password: str | None = Header(default=None, alias=DEMO_PASSWORD_HEADER),
-) -> None:
-  if user != "user" or password != "password":
+) -> str:
+  if user != MVP_USERNAME or password != MVP_PASSWORD:
     raise HTTPException(status_code=401, detail="Unauthorized")
+  return user
 
 
 DEFAULT_BOARD: dict = {
@@ -230,16 +229,21 @@ def get_db_path() -> Path:
   return Path("backend/data/pm.sqlite")
 
 
-def get_connection(db_path: Path) -> sqlite3.Connection:
-  db_path.parent.mkdir(parents=True, exist_ok=True)
+@contextmanager
+def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
   connection = sqlite3.connect(db_path)
   connection.row_factory = sqlite3.Row
   connection.execute("PRAGMA foreign_keys = ON")
-  return connection
+  try:
+    with connection:
+      yield connection
+  finally:
+    connection.close()
 
 
 def init_database(db_path: Path) -> None:
-  with get_connection(db_path) as connection:
+  db_path.parent.mkdir(parents=True, exist_ok=True)
+  with connect(db_path) as connection:
     connection.executescript(
       """
       CREATE TABLE IF NOT EXISTS users (
@@ -271,86 +275,53 @@ def init_database(db_path: Path) -> None:
     if "revision" not in existing_columns:
       connection.execute("ALTER TABLE boards ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
 
+    ensure_user_and_board(connection, MVP_USERNAME)
 
-def ensure_user_and_board(connection: sqlite3.Connection, username: str) -> int:
+
+def ensure_user_and_board(connection: sqlite3.Connection, username: str) -> None:
+  connection.execute("INSERT OR IGNORE INTO users (username) VALUES (?)", (username,))
   connection.execute(
-    "INSERT OR IGNORE INTO users (username) VALUES (?)",
-    (username,),
+    """
+    INSERT OR IGNORE INTO boards (user_id, board_json)
+    SELECT id, ? FROM users WHERE username = ?
+    """,
+    (default_board_model().model_dump_json(), username),
   )
-  user_row = connection.execute(
-    "SELECT id FROM users WHERE username = ?",
-    (username,),
-  ).fetchone()
-  if user_row is None:
-    raise RuntimeError(f"Unable to resolve user id for username '{username}'.")
-
-  user_id = int(user_row["id"])
-  existing_board = connection.execute(
-    "SELECT id FROM boards WHERE user_id = ?",
-    (user_id,),
-  ).fetchone()
-
-  if existing_board is None:
-    connection.execute(
-      """
-      INSERT INTO boards (user_id, board_json, revision, schema_version)
-      VALUES (?, ?, 1, 1)
-      """,
-      (user_id, default_board_model().model_dump_json()),
-    )
-
-  return user_id
 
 
 def load_board(connection: sqlite3.Connection, username: str) -> tuple[BoardDataModel, int]:
-  user_id = ensure_user_and_board(connection, username)
   row = connection.execute(
-    "SELECT board_json, revision FROM boards WHERE user_id = ?",
-    (user_id,),
+    """
+    SELECT boards.board_json, boards.revision
+    FROM boards JOIN users ON users.id = boards.user_id
+    WHERE users.username = ?
+    """,
+    (username,),
   ).fetchone()
   if row is None:
-    raise RuntimeError(f"No board found for username '{username}'.")
-
-  board_data = json.loads(row["board_json"])
-  revision = int(row["revision"])
-  return BoardDataModel.model_validate(board_data), revision
+    raise HTTPException(status_code=404, detail="Board not found.")
+  return BoardDataModel.model_validate_json(row["board_json"]), row["revision"]
 
 
 def save_board(
   connection: sqlite3.Connection,
   username: str,
   board: BoardDataModel,
-  expected_revision: int | None = None,
+  expected_revision: int | None,
 ) -> int:
-  user_id = ensure_user_and_board(connection, username)
-  if expected_revision is None:
-    connection.execute(
-      """
-      UPDATE boards
-      SET board_json = ?, revision = revision + 1, schema_version = 1, updated_at = CURRENT_TIMESTAMP
-      WHERE user_id = ?
-      """,
-      (board.model_dump_json(), user_id),
-    )
-  else:
-    cursor = connection.execute(
-      """
-      UPDATE boards
-      SET board_json = ?, revision = revision + 1, schema_version = 1, updated_at = CURRENT_TIMESTAMP
-      WHERE user_id = ? AND revision = ?
-      """,
-      (board.model_dump_json(), user_id, expected_revision),
-    )
-    if cursor.rowcount == 0:
-      raise HTTPException(status_code=409, detail="Board has changed. Please reload latest data.")
-
-  row = connection.execute(
-    "SELECT revision FROM boards WHERE user_id = ?",
-    (user_id,),
-  ).fetchone()
+  query = """
+    UPDATE boards
+    SET board_json = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = (SELECT id FROM users WHERE username = ?)
+  """
+  params: list = [board.model_dump_json(), username]
+  if expected_revision is not None:
+    query += " AND revision = ?"
+    params.append(expected_revision)
+  row = connection.execute(query + " RETURNING revision", params).fetchone()
   if row is None:
-    raise RuntimeError(f"No board found for username '{username}' after save.")
-  return int(row["revision"])
+    raise HTTPException(status_code=409, detail="Board has changed. Please reload latest data.")
+  return row["revision"]
 
 
 def find_column(board: BoardDataModel, column_id: str) -> ColumnModel:
@@ -425,302 +396,30 @@ def apply_operation(board: BoardDataModel, operation: BoardOperation) -> BoardDa
   raise HTTPException(status_code=400, detail="Unknown operation type.")
 
 
-def request_openrouter_completion(question: str) -> AIPingResponse:
+def apply_operations(board: BoardDataModel, operations: list[BoardOperation]) -> BoardDataModel:
+  for operation in operations:
+    board = apply_operation(board, operation)
+  # Re-validate invariants before persisting.
+  return BoardDataModel.model_validate(board.model_dump())
+
+
+def call_openrouter(messages: list[dict], response_format: dict | None = None) -> tuple[str, str]:
   api_key = os.getenv("OPENROUTER_API_KEY")
   if not api_key:
     raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not configured.")
 
   model = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b")
-  payload = {
-    "model": model,
-    "messages": [
-      {
-        "role": "system",
-        "content": "You are a concise assistant. Answer in plain text.",
-      },
-      {"role": "user", "content": question},
-    ],
-  }
-  headers = {
-    "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json",
-  }
+  payload: dict = {"model": model, "messages": messages}
+  if response_format is not None:
+    payload["response_format"] = response_format
+    # Only route to providers that honor structured outputs. DeepInfra accepts
+    # response_format for this model but often returns prose instead of the schema.
+    payload["provider"] = {"require_parameters": True, "ignore": ["DeepInfra"]}
 
   try:
     response = httpx.post(
       "https://openrouter.ai/api/v1/chat/completions",
-      headers=headers,
-      json=payload,
-      timeout=30.0,
-    )
-    response.raise_for_status()
-  except httpx.HTTPStatusError as error:
-    raise HTTPException(
-      status_code=502,
-      detail=f"OpenRouter returned HTTP {error.response.status_code}.",
-    ) from error
-  except httpx.HTTPError as error:
-    raise HTTPException(status_code=502, detail="Failed to reach OpenRouter.") from error
-
-  data = response.json()
-  answer = ""
-  if data.get("choices"):
-    message = data["choices"][0].get("message", {})
-    answer = str(message.get("content", "")).strip()
-
-  if not answer:
-    raise HTTPException(status_code=502, detail="OpenRouter response did not contain text.")
-
-  return AIPingResponse(model=model, answer=answer)
-
-
-def parse_json_object_from_text(text: str) -> dict:
-  stripped = text.strip()
-  try:
-    value = json.loads(stripped)
-    if isinstance(value, dict):
-      return value
-  except json.JSONDecodeError:
-    pass
-
-  decoder = json.JSONDecoder()
-  start_index = stripped.find("{")
-  while start_index != -1:
-    try:
-      candidate, _ = decoder.raw_decode(stripped[start_index:])
-      if isinstance(candidate, dict):
-        return candidate
-    except json.JSONDecodeError:
-      pass
-    start_index = stripped.find("{", start_index + 1)
-
-  raise HTTPException(status_code=502, detail="OpenRouter did not return valid JSON content.")
-
-
-def normalize_operation(raw_operation: dict) -> dict | None:
-  operation_type = str(raw_operation.get("type", "")).strip()
-  if not operation_type:
-    return None
-
-  if operation_type == "rename_column":
-    column_id = raw_operation.get("columnId") or raw_operation.get("column_id")
-    title = raw_operation.get("title")
-    if not column_id or not title:
-      return None
-    return {"type": "rename_column", "columnId": str(column_id), "title": str(title)}
-
-  if operation_type == "add_card":
-    column_id = raw_operation.get("columnId") or raw_operation.get("column_id")
-    title = raw_operation.get("title")
-    details = raw_operation.get("details", "No details yet.")
-    if not column_id or not title:
-      return None
-    return {
-      "type": "add_card",
-      "columnId": str(column_id),
-      "title": str(title),
-      "details": str(details),
-    }
-
-  if operation_type == "update_card":
-    card_id = raw_operation.get("cardId") or raw_operation.get("card_id")
-    title = raw_operation.get("title")
-    details = raw_operation.get("details")
-    if not card_id:
-      return None
-    normalized: dict = {"type": "update_card", "cardId": str(card_id)}
-    if title is not None:
-      normalized["title"] = str(title)
-    if details is not None:
-      normalized["details"] = str(details)
-    return normalized
-
-  if operation_type == "delete_card":
-    card_id = raw_operation.get("cardId") or raw_operation.get("card_id")
-    if not card_id:
-      return None
-    return {"type": "delete_card", "cardId": str(card_id)}
-
-  if operation_type == "move_card":
-    card_id = raw_operation.get("cardId") or raw_operation.get("card_id")
-    target_column_id = raw_operation.get("targetColumnId") or raw_operation.get("target_column_id")
-    before_card_id = raw_operation.get("beforeCardId") or raw_operation.get("before_card_id")
-    if not card_id or not target_column_id:
-      return None
-    normalized_move = {
-      "type": "move_card",
-      "cardId": str(card_id),
-      "targetColumnId": str(target_column_id),
-    }
-    if before_card_id is not None:
-      normalized_move["beforeCardId"] = str(before_card_id)
-    return normalized_move
-
-  return None
-
-
-def normalize_chat_output(parsed: dict) -> AIChatLLMOutput:
-  assistant_response = parsed.get("assistantResponse")
-  if assistant_response is None:
-    assistant_response = parsed.get("assistant_response")
-  if assistant_response is None:
-    assistant_response = parsed.get("response")
-  if assistant_response is None:
-    assistant_response = parsed.get("message")
-  if not isinstance(assistant_response, str) or not assistant_response.strip():
-    raise HTTPException(status_code=502, detail="OpenRouter JSON missing assistant response text.")
-
-  raw_operations = parsed.get("operations", [])
-  if not isinstance(raw_operations, list):
-    raw_operations = []
-
-  normalized_operations: list[dict] = []
-  for raw_operation in raw_operations:
-    if not isinstance(raw_operation, dict):
-      continue
-    normalized = normalize_operation(raw_operation)
-    if normalized is not None:
-      normalized_operations.append(normalized)
-
-  return AIChatLLMOutput.model_validate(
-    {
-      "assistantResponse": assistant_response.strip(),
-      "operations": normalized_operations,
-    }
-  )
-
-
-def infer_column_id_from_message(message: str) -> str | None:
-  lowered = message.lower()
-  explicit_column_id = re.search(r"\b(col-[a-z0-9-]+)\b", lowered)
-  if explicit_column_id:
-    return explicit_column_id.group(1)
-
-  keyword_map = {
-    "backlog": "col-backlog",
-    "discovery": "col-discovery",
-    "in progress": "col-progress",
-    "progress": "col-progress",
-    "review": "col-review",
-    "done": "col-done",
-  }
-  for keyword, column_id in keyword_map.items():
-    if keyword in lowered:
-      return column_id
-  return None
-
-
-def infer_operations_from_message(message: str) -> list[dict]:
-  lowered = message.lower()
-  if "add" not in lowered or "card" not in lowered:
-    return []
-
-  column_id = infer_column_id_from_message(message)
-  if column_id is None:
-    return []
-
-  title_match = re.search(r"titled\s+['\"]([^'\"]+)['\"]", message, flags=re.IGNORECASE)
-  if title_match is None:
-    title_match = re.search(r"title\s+['\"]([^'\"]+)['\"]", message, flags=re.IGNORECASE)
-  if title_match is None:
-    return []
-
-  details_match = re.search(
-    r"details\s+['\"]([^'\"]+)['\"]",
-    message,
-    flags=re.IGNORECASE,
-  )
-  details = details_match.group(1) if details_match else "No details yet."
-
-  return [
-    {
-      "type": "add_card",
-      "columnId": column_id,
-      "title": title_match.group(1),
-      "details": details,
-    }
-  ]
-
-
-def request_openrouter_kanban_response(
-  board: BoardDataModel,
-  message: str,
-  history: list[AIConversationMessage],
-) -> AIChatLLMOutput:
-  api_key = os.getenv("OPENROUTER_API_KEY")
-  if not api_key:
-    raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not configured.")
-
-  model = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b")
-  messages = [
-    {
-      "role": "system",
-      "content": (
-        "You are an assistant for a kanban board. "
-        "Always reply with strict JSON containing keys assistantResponse and operations. "
-        "operations is an array of board operations using supported types only."
-      ),
-    }
-  ]
-  for entry in history:
-    messages.append({"role": entry.role, "content": entry.content})
-
-  user_payload = {
-    "userQuestion": message,
-    "board": board.model_dump(),
-  }
-  messages.append({"role": "user", "content": json.dumps(user_payload)})
-
-  response_format = {
-    "type": "json_schema",
-    "json_schema": {
-      "name": "kanban_structured_output",
-      "strict": True,
-      "schema": {
-        "type": "object",
-        "properties": {
-          "assistantResponse": {"type": "string"},
-          "operations": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "type": {
-                  "type": "string",
-                  "enum": [
-                    "rename_column",
-                    "add_card",
-                    "update_card",
-                    "delete_card",
-                    "move_card",
-                  ],
-                }
-              },
-              "required": ["type"],
-              "additionalProperties": True,
-            },
-          },
-        },
-        "required": ["assistantResponse", "operations"],
-        "additionalProperties": False,
-      },
-    },
-  }
-
-  payload = {
-    "model": model,
-    "messages": messages,
-    "response_format": response_format,
-  }
-  headers = {
-    "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json",
-  }
-
-  try:
-    response = httpx.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      headers=headers,
+      headers={"Authorization": f"Bearer {api_key}"},
       json=payload,
       timeout=45.0,
     )
@@ -733,13 +432,97 @@ def request_openrouter_kanban_response(
   except httpx.HTTPError as error:
     raise HTTPException(status_code=502, detail="Failed to reach OpenRouter.") from error
 
-  data = response.json()
-  content = ""
-  if data.get("choices"):
-    content = str(data["choices"][0].get("message", {}).get("content", "")).strip()
+  content = (response.json()["choices"][0]["message"].get("content") or "").strip()
+  if not content:
+    raise HTTPException(status_code=502, detail="OpenRouter response did not contain text.")
+  return model, content
 
-  parsed = parse_json_object_from_text(content)
-  return normalize_chat_output(parsed)
+
+def request_openrouter_completion(question: str) -> AIPingResponse:
+  model, answer = call_openrouter(
+    [
+      {"role": "system", "content": "You are a concise assistant. Answer in plain text."},
+      {"role": "user", "content": question},
+    ]
+  )
+  return AIPingResponse(model=model, answer=answer)
+
+
+STRING = {"type": "string"}
+NULLABLE_STRING = {"type": ["string", "null"]}
+
+
+def operation_schema(operation_type: str, **properties: dict) -> dict:
+  return {
+    "type": "object",
+    "properties": {"type": {"type": "string", "enum": [operation_type]}, **properties},
+    "required": ["type", *properties],
+    "additionalProperties": False,
+  }
+
+
+KANBAN_RESPONSE_FORMAT = {
+  "type": "json_schema",
+  "json_schema": {
+    "name": "kanban_structured_output",
+    "strict": True,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "assistantResponse": STRING,
+        "operations": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              operation_schema("rename_column", columnId=STRING, title=STRING),
+              operation_schema("add_card", columnId=STRING, title=STRING, details=STRING),
+              operation_schema(
+                "update_card", cardId=STRING, title=NULLABLE_STRING, details=NULLABLE_STRING
+              ),
+              operation_schema("delete_card", cardId=STRING),
+              operation_schema(
+                "move_card", cardId=STRING, targetColumnId=STRING, beforeCardId=NULLABLE_STRING
+              ),
+            ]
+          },
+        },
+      },
+      "required": ["assistantResponse", "operations"],
+      "additionalProperties": False,
+    },
+  },
+}
+
+KANBAN_SYSTEM_PROMPT = """You are an assistant for a kanban board.
+Each user message is JSON with "userQuestion" and the current "board".
+Reply with "assistantResponse" (plain text for the user) and "operations" (board changes to apply).
+Supported operations:
+- rename_column: columnId, title
+- add_card: columnId, title, details
+- update_card: cardId, title, details (null keeps the current value)
+- delete_card: cardId
+- move_card: cardId, targetColumnId, beforeCardId (null appends to the end of the column)
+Use only column and card ids that exist in the board.
+Only include operations when the user asks for a change; otherwise return an empty array."""
+
+
+def request_openrouter_kanban_response(
+  board: BoardDataModel,
+  message: str,
+  history: list[AIConversationMessage],
+) -> AIChatLLMOutput:
+  messages = [{"role": "system", "content": KANBAN_SYSTEM_PROMPT}]
+  messages += [{"role": entry.role, "content": entry.content} for entry in history]
+  user_payload = {"userQuestion": message, "board": board.model_dump()}
+  messages.append({"role": "user", "content": json.dumps(user_payload)})
+
+  _, content = call_openrouter(messages, KANBAN_RESPONSE_FORMAT)
+  try:
+    return AIChatLLMOutput.model_validate_json(content)
+  except ValidationError as error:
+    raise HTTPException(
+      status_code=502, detail="OpenRouter returned output that does not match the schema."
+    ) from error
 
 
 def create_app(db_path: Path | None = None, frontend_dist: Path | None = None) -> FastAPI:
@@ -758,87 +541,60 @@ def create_app(db_path: Path | None = None, frontend_dist: Path | None = None) -
     return {"status": "ok", "service": "pm-backend"}
 
   @app.get("/api/board", response_model=BoardResponse)
-  def get_board(username: str = "user", _: None = Depends(enforce_demo_auth)) -> BoardResponse:
-    with get_connection(resolved_db_path) as connection:
+  def get_board(username: str = Depends(current_user)) -> BoardResponse:
+    with connect(resolved_db_path) as connection:
       board, revision = load_board(connection, username)
-      return BoardResponse(username=username, revision=revision, board=board)
+    return BoardResponse(username=username, revision=revision, board=board)
 
   @app.put("/api/board", response_model=BoardResponse)
-  def put_board(payload: PutBoardRequest, _: None = Depends(enforce_demo_auth)) -> BoardResponse:
-    with get_connection(resolved_db_path) as connection:
-      revision = save_board(
-        connection,
-        payload.username,
-        payload.board,
-        expected_revision=payload.revision,
-      )
-      board, _ = load_board(connection, payload.username)
-      return BoardResponse(username=payload.username, revision=revision, board=board)
+  def put_board(payload: PutBoardRequest, username: str = Depends(current_user)) -> BoardResponse:
+    with connect(resolved_db_path) as connection:
+      revision = save_board(connection, username, payload.board, payload.revision)
+    return BoardResponse(username=username, revision=revision, board=payload.board)
 
   @app.post("/api/board/operations", response_model=BoardResponse)
   def apply_board_operations(
     payload: ApplyOperationsRequest,
-    _: None = Depends(enforce_demo_auth),
+    username: str = Depends(current_user),
   ) -> BoardResponse:
-    with get_connection(resolved_db_path) as connection:
-      board, current_revision = load_board(connection, payload.username)
-      for operation in payload.operations:
-        board = apply_operation(board, operation)
-      # Re-validate invariants before persisting.
-      board = BoardDataModel.model_validate(board.model_dump())
-      revision = save_board(
-        connection,
-        payload.username,
-        board,
-        expected_revision=payload.revision if payload.revision is not None else current_revision,
-      )
-      return BoardResponse(username=payload.username, revision=revision, board=board)
+    with connect(resolved_db_path) as connection:
+      board, current_revision = load_board(connection, username)
+      board = apply_operations(board, payload.operations)
+      expected_revision = payload.revision if payload.revision is not None else current_revision
+      revision = save_board(connection, username, board, expected_revision)
+    return BoardResponse(username=username, revision=revision, board=board)
 
   @app.post("/api/ai/ping", response_model=AIPingResponse)
-  def ai_ping(payload: AIPingRequest, _: None = Depends(enforce_demo_auth)) -> AIPingResponse:
+  def ai_ping(payload: AIPingRequest, _: str = Depends(current_user)) -> AIPingResponse:
     return request_openrouter_completion(payload.question)
 
   @app.post("/api/ai/chat", response_model=AIChatResponse)
-  def ai_chat(payload: AIChatRequest, _: None = Depends(enforce_demo_auth)) -> AIChatResponse:
-    with get_connection(resolved_db_path) as connection:
-      board, current_revision = load_board(connection, payload.username)
-      llm_output = request_openrouter_kanban_response(
-        board=board,
-        message=payload.message,
-        history=payload.history,
-      )
+  def ai_chat(payload: AIChatRequest, username: str = Depends(current_user)) -> AIChatResponse:
+    # No connection is held during the LLM call, so board saves are not blocked.
+    with connect(resolved_db_path) as connection:
+      board, revision = load_board(connection, username)
 
-      if not llm_output.operations:
-        inferred_operations = infer_operations_from_message(payload.message)
-        if inferred_operations:
-          llm_output = AIChatLLMOutput.model_validate(
-            {
-              "assistantResponse": llm_output.assistantResponse,
-              "operations": inferred_operations,
-            }
-          )
+    llm_output = request_openrouter_kanban_response(board, payload.message, payload.history)
 
-      for operation in llm_output.operations:
-        board = apply_operation(board, operation)
+    if llm_output.operations:
+      # Apply to the latest board so edits made during the LLM call are kept.
+      with connect(resolved_db_path) as connection:
+        board, current_revision = load_board(connection, username)
+        try:
+          board = apply_operations(board, llm_output.operations)
+        except HTTPException as error:
+          raise HTTPException(
+            status_code=502, detail=f"AI proposed an invalid change: {error.detail}"
+          ) from error
+        revision = save_board(connection, username, board, current_revision)
 
-      board = BoardDataModel.model_validate(board.model_dump())
-      board_updated = len(llm_output.operations) > 0
-      revision = current_revision
-      if board_updated:
-        revision = save_board(
-          connection,
-          payload.username,
-          board,
-          expected_revision=payload.revision if payload.revision is not None else current_revision,
-        )
-
-      return AIChatResponse(
-        assistantResponse=llm_output.assistantResponse,
-        boardUpdated=board_updated,
-        operationsApplied=len(llm_output.operations),
-        revision=revision,
-        board=board,
-      )
+    return AIChatResponse(
+      assistantResponse=llm_output.assistantResponse,
+      boardUpdated=bool(llm_output.operations),
+      operationsApplied=len(llm_output.operations),
+      revision=revision,
+      board=board,
+    )
 
   if resolved_frontend_dist.exists():
     app.mount(

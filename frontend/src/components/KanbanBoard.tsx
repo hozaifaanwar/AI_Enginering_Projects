@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -14,7 +14,7 @@ import {
 import { AIChatSidebar, type ChatMessage } from "@/components/AIChatSidebar";
 import { KanbanColumn } from "@/components/KanbanColumn";
 import { KanbanCardPreview } from "@/components/KanbanCardPreview";
-import { createId, initialData, moveCard, type BoardData } from "@/lib/kanban";
+import { createId, moveCard, type BoardData } from "@/lib/kanban";
 
 const AUTH_STORAGE_KEY = "pm-authenticated";
 const MVP_USERNAME = "user";
@@ -23,9 +23,31 @@ const DEMO_AUTH_HEADERS = {
   "X-Demo-User": MVP_USERNAME,
   "X-Demo-Password": MVP_PASSWORD,
 };
+const INITIAL_CHAT_MESSAGES: ChatMessage[] = [
+  {
+    role: "assistant",
+    content: "I can summarize progress and update cards when you ask.",
+  },
+];
+
+type BoardPayload = { board: BoardData; revision: number };
+
+const apiFetch = (path: string, init?: RequestInit) =>
+  fetch(path, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...DEMO_AUTH_HEADERS },
+  });
+
+const errorMessage = async (response: Response) => {
+  const body = await response.json().catch(() => ({}));
+  return typeof body.detail === "string"
+    ? body.detail
+    : `Request failed with status ${response.status}.`;
+};
 
 export const KanbanBoard = () => {
-  const [board, setBoard] = useState<BoardData>(() => initialData);
+  const [board, setBoard] = useState<BoardData | null>(null);
+  const [loadError, setLoadError] = useState("");
   const [activeCardId, setActiveCardId] = useState<string | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -33,20 +55,15 @@ export const KanbanBoard = () => {
   const [password, setPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [syncMessage, setSyncMessage] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content: "I can summarize progress and update cards when you ask.",
-    },
-  ]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
   const [chatError, setChatError] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
-  const boardRevisionRef = useRef(1);
+  const revisionRef = useRef(0);
+  // Saves run one at a time; edits made while a save is in flight are sent next.
+  const pendingBoardRef = useRef<BoardData | null>(null);
+  const savingRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
     setIsAuthenticated(window.localStorage.getItem(AUTH_STORAGE_KEY) === "true");
     setIsAuthReady(true);
   }, []);
@@ -57,147 +74,102 @@ export const KanbanBoard = () => {
     })
   );
 
-  const cardsById = useMemo(() => board.cards, [board.cards]);
+  const loadBoard = async () => {
+    try {
+      const response = await apiFetch("/api/board");
+      if (!response.ok) {
+        throw new Error(await errorMessage(response));
+      }
+      const payload = (await response.json()) as BoardPayload;
+      revisionRef.current = payload.revision;
+      setBoard(payload.board);
+    } catch (error) {
+      setLoadError(`Could not load the board. ${(error as Error).message}`);
+    }
+  };
 
-  const persistBoard = async (nextBoard: BoardData) => {
-    if (typeof fetch !== "function") {
+  useEffect(() => {
+    if (isAuthenticated) {
+      void loadBoard();
+    }
+  }, [isAuthenticated]);
+
+  const saveBoard = async () => {
+    try {
+      while (pendingBoardRef.current) {
+        const boardToSave = pendingBoardRef.current;
+        pendingBoardRef.current = null;
+        const response = await apiFetch("/api/board", {
+          method: "PUT",
+          body: JSON.stringify({ revision: revisionRef.current, board: boardToSave }),
+        });
+        if (response.status === 409) {
+          await loadBoard();
+          pendingBoardRef.current = null;
+          setSyncMessage("The board changed elsewhere. Reloaded the latest version.");
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(await errorMessage(response));
+        }
+        revisionRef.current = ((await response.json()) as BoardPayload).revision;
+      }
+      setSyncMessage("");
+    } catch (error) {
+      setSyncMessage(`Could not save changes. ${(error as Error).message}`);
+    }
+  };
+
+  const updateBoard = (change: (current: BoardData) => BoardData) => {
+    if (!board) {
       return;
     }
-
-    try {
-      const response = await fetch("/api/board", {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...DEMO_AUTH_HEADERS,
-        },
-        body: JSON.stringify({
-          username: MVP_USERNAME,
-          revision: boardRevisionRef.current,
-          board: nextBoard,
-        }),
+    const nextBoard = change(board);
+    setBoard(nextBoard);
+    pendingBoardRef.current = nextBoard;
+    if (!savingRef.current) {
+      savingRef.current = saveBoard().finally(() => {
+        savingRef.current = null;
       });
-
-      if (response.status === 409) {
-        const latest = await fetch(`/api/board?username=${MVP_USERNAME}`, {
-          headers: DEMO_AUTH_HEADERS,
-        });
-        if (latest.ok) {
-          const latestPayload = (await latest.json()) as {
-            board: BoardData;
-            revision: number;
-          };
-          setBoard(latestPayload.board);
-          boardRevisionRef.current = latestPayload.revision;
-          setSyncMessage("Detected concurrent change. Reloaded latest board.");
-        }
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(`Persist failed with status ${response.status}`);
-      }
-
-      const payload = (await response.json()) as { board: BoardData; revision: number };
-      setBoard(payload.board);
-      boardRevisionRef.current = payload.revision;
-      setSyncMessage("");
-    } catch {
-      setSyncMessage("Working locally. Backend sync is currently unavailable.");
     }
   };
 
   const sendChatMessage = async (message: string) => {
     setChatError("");
-    const nextMessages = [...chatMessages, { role: "user", content: message } as const];
-    setChatMessages(nextMessages);
+    const history = chatMessages;
+    setChatMessages([...history, { role: "user", content: message }]);
     setIsChatLoading(true);
 
     try {
-      const response = await fetch("/api/ai/chat", {
+      // The AI applies changes to the saved board, so pending edits go first.
+      await savingRef.current;
+      const response = await apiFetch("/api/ai/chat", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...DEMO_AUTH_HEADERS,
-        },
-        body: JSON.stringify({
-          username: MVP_USERNAME,
-          revision: boardRevisionRef.current,
-          message,
-          history: nextMessages,
-        }),
+        body: JSON.stringify({ message, history }),
       });
-
       if (!response.ok) {
-        throw new Error(`AI chat failed with status ${response.status}`);
+        throw new Error(await errorMessage(response));
       }
 
-      const payload = (await response.json()) as {
+      const payload = (await response.json()) as BoardPayload & {
         assistantResponse: string;
         boardUpdated: boolean;
-        revision: number;
-        board: BoardData;
       };
-
       setChatMessages((prev) => [
         ...prev,
         { role: "assistant", content: payload.assistantResponse },
       ]);
-
       if (payload.boardUpdated) {
+        revisionRef.current = payload.revision;
         setBoard(payload.board);
         setSyncMessage("Board updated by AI.");
       }
-      boardRevisionRef.current = payload.revision;
-    } catch {
-      setChatError("AI request failed. Please try again.");
-      setChatMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "I could not reach the AI service right now.",
-        },
-      ]);
+    } catch (error) {
+      setChatError(`AI request failed. ${(error as Error).message}`);
     } finally {
       setIsChatLoading(false);
     }
   };
-
-  useEffect(() => {
-    if (!isAuthenticated || typeof fetch !== "function") {
-      return;
-    }
-
-    let cancelled = false;
-
-    const loadBoard = async () => {
-      try {
-        const response = await fetch(`/api/board?username=${MVP_USERNAME}`, {
-          headers: DEMO_AUTH_HEADERS,
-        });
-        if (!response.ok) {
-          throw new Error(`Load failed with status ${response.status}`);
-        }
-        const payload = (await response.json()) as { board: BoardData; revision: number };
-        if (!cancelled) {
-          setBoard(payload.board);
-          boardRevisionRef.current = payload.revision;
-          setSyncMessage("");
-        }
-      } catch {
-        if (!cancelled) {
-          setBoard(initialData);
-          setSyncMessage("Working locally. Backend sync is currently unavailable.");
-        }
-      }
-    };
-
-    void loadBoard();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isAuthenticated]);
 
   const handleDragStart = (event: DragStartEvent) => {
     setActiveCardId(event.active.id as string);
@@ -211,71 +183,60 @@ export const KanbanBoard = () => {
       return;
     }
 
-    setBoard((prev) => {
-      const nextBoard = {
-        ...prev,
-        columns: moveCard(prev.columns, active.id as string, over.id as string),
-      };
-      void persistBoard(nextBoard);
-      return nextBoard;
-    });
+    updateBoard((current) => ({
+      ...current,
+      columns: moveCard(current.columns, active.id as string, over.id as string),
+    }));
   };
 
   const handleRenameColumn = (columnId: string, title: string) => {
-    setBoard((prev) => {
-      const nextBoard = {
-        ...prev,
-        columns: prev.columns.map((column) =>
-          column.id === columnId ? { ...column, title } : column
-        ),
-      };
-      void persistBoard(nextBoard);
-      return nextBoard;
-    });
+    updateBoard((current) => ({
+      ...current,
+      columns: current.columns.map((column) =>
+        column.id === columnId ? { ...column, title } : column
+      ),
+    }));
   };
 
   const handleAddCard = (columnId: string, title: string, details: string) => {
     const id = createId("card");
-    setBoard((prev) => {
-      const nextBoard = {
-        ...prev,
-        cards: {
-          ...prev.cards,
-          [id]: { id, title, details: details || "No details yet." },
-        },
-        columns: prev.columns.map((column) =>
-          column.id === columnId
-            ? { ...column, cardIds: [...column.cardIds, id] }
-            : column
-        ),
-      };
-      void persistBoard(nextBoard);
-      return nextBoard;
-    });
+    updateBoard((current) => ({
+      ...current,
+      cards: {
+        ...current.cards,
+        [id]: { id, title, details: details || "No details yet." },
+      },
+      columns: current.columns.map((column) =>
+        column.id === columnId
+          ? { ...column, cardIds: [...column.cardIds, id] }
+          : column
+      ),
+    }));
+  };
+
+  const handleEditCard = (cardId: string, title: string, details: string) => {
+    updateBoard((current) => ({
+      ...current,
+      cards: { ...current.cards, [cardId]: { id: cardId, title, details } },
+    }));
   };
 
   const handleDeleteCard = (columnId: string, cardId: string) => {
-    setBoard((prev) => {
-      const nextBoard = {
-        ...prev,
-        cards: Object.fromEntries(
-          Object.entries(prev.cards).filter(([id]) => id !== cardId)
-        ),
-        columns: prev.columns.map((column) =>
-          column.id === columnId
-            ? {
-                ...column,
-                cardIds: column.cardIds.filter((id) => id !== cardId),
-              }
-            : column
-        ),
-      };
-      void persistBoard(nextBoard);
-      return nextBoard;
-    });
+    updateBoard((current) => ({
+      ...current,
+      cards: Object.fromEntries(
+        Object.entries(current.cards).filter(([id]) => id !== cardId)
+      ),
+      columns: current.columns.map((column) =>
+        column.id === columnId
+          ? {
+              ...column,
+              cardIds: column.cardIds.filter((id) => id !== cardId),
+            }
+          : column
+      ),
+    }));
   };
-
-  const activeCard = activeCardId ? cardsById[activeCardId] : null;
 
   const handleLogin = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -294,17 +255,14 @@ export const KanbanBoard = () => {
   const handleLogout = () => {
     window.localStorage.removeItem(AUTH_STORAGE_KEY);
     setIsAuthenticated(false);
+    setBoard(null);
+    setLoadError("");
     setUsername("");
     setPassword("");
     setAuthError("");
     setSyncMessage("");
     setChatError("");
-    setChatMessages([
-      {
-        role: "assistant",
-        content: "I can summarize progress and update cards when you ask.",
-      },
-    ]);
+    setChatMessages(INITIAL_CHAT_MESSAGES);
   };
 
   if (!isAuthReady) {
@@ -371,6 +329,32 @@ export const KanbanBoard = () => {
       </main>
     );
   }
+
+  if (!board) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-[680px] flex-col items-center justify-center gap-4 px-6 py-12">
+        {loadError ? (
+          <>
+            <p className="text-sm font-medium text-[var(--secondary-purple)]">{loadError}</p>
+            <button
+              type="button"
+              onClick={() => {
+                setLoadError("");
+                void loadBoard();
+              }}
+              className="h-11 rounded-xl bg-[var(--secondary-purple)] px-4 text-sm font-semibold text-white transition hover:opacity-90"
+            >
+              Retry
+            </button>
+          </>
+        ) : (
+          <p className="text-sm font-medium text-[var(--gray-text)]">Loading board…</p>
+        )}
+      </main>
+    );
+  }
+
+  const activeCard = activeCardId ? board.cards[activeCardId] : null;
 
   return (
     <div className="relative overflow-hidden">
@@ -439,6 +423,7 @@ export const KanbanBoard = () => {
                   cards={column.cardIds.map((cardId) => board.cards[cardId])}
                   onRename={handleRenameColumn}
                   onAddCard={handleAddCard}
+                  onEditCard={handleEditCard}
                   onDeleteCard={handleDeleteCard}
                 />
               ))}

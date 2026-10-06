@@ -1,8 +1,8 @@
-# Database Schema Proposal (Part 5)
+# Database Schema
 
 ## Scope
 
-This is a design artifact only for sign-off. No persistence code is implemented in this part.
+SQLite schema used by the backend (`backend/app/main.py`). Designed in Part 5, implemented in Part 6.
 
 ## Goals
 
@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS boards (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL UNIQUE,
   board_json TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
   schema_version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -41,12 +42,12 @@ CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
 - `boards.user_id UNIQUE` enforces the MVP rule: one board per user.
 - `board_json` keeps board persistence simple and aligned with frontend state shape.
 - `schema_version` allows controlled JSON migrations in future parts.
+- `revision` increments on every write and is used for optimistic concurrency (see below).
 
 ## JSON Payload Shape (board_json)
 
 ```json
 {
-  "schemaVersion": 1,
   "columns": [
     { "id": "col-backlog", "title": "Backlog", "cardIds": ["card-1", "card-2"] },
     { "id": "col-progress", "title": "In Progress", "cardIds": ["card-3"] }
@@ -67,20 +68,23 @@ CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
 - Card order inside each column is the order of `cardIds` array.
 - The `cards` object is treated as an ID map, not as an ordering source.
 
-## Initialization Strategy (Part 6 Implementation Target)
+## Initialization
 
 On startup:
 
-1. Open SQLite database file.
-2. Execute `CREATE TABLE IF NOT EXISTS` statements.
-3. Ensure the MVP user row exists if needed by the auth flow.
-4. Ensure one board row exists for that user; if not, seed from initial board data.
+1. Create the database file and directory if missing.
+2. Execute `CREATE TABLE IF NOT EXISTS` statements, and add the `revision` column to older databases.
+3. Ensure the MVP user row and its board exist, seeding the board from the default data.
 
-## Planned API Implications (Part 6+)
+Read paths never write.
 
-- `GET /api/board` returns parsed `board_json` for the authenticated user.
-- Mutation endpoints update board JSON and refresh `updated_at`.
-- All write paths validate payload shape before persist.
+## API Behavior
+
+- The username always comes from the auth headers, never from the request body or query.
+- `GET /api/board` returns the board and its `revision`.
+- `PUT /api/board` and `POST /api/board/operations` take the `revision` the client last saw. The update only applies when it matches (`UPDATE ... WHERE revision = ?`); otherwise the API returns 409 and the client reloads.
+- `POST /api/ai/chat` does not hold a connection during the LLM call. It then applies the AI operations to the latest board in one transaction.
+- All write paths validate the board shape before saving.
 
 ## Tradeoffs
 
@@ -93,7 +97,7 @@ Pros:
 Cons:
 
 - Harder to query card-level analytics directly with SQL.
-- Concurrency control requires whole-document update strategy.
+- Concurrency control is whole-document, via the `revision` check.
 
 ## Future Upgrade Path (post-MVP)
 

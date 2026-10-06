@@ -4,11 +4,11 @@ This document describes the current frontend implementation in `frontend/` so fu
 
 ## Purpose
 
-The frontend is a Next.js app that currently provides a local-first Kanban board experience (no backend persistence yet).
+A Next.js app, exported as static files and served by the FastAPI backend. It shows a sign-in screen, then a Kanban board loaded from and saved to the backend, plus an AI chat sidebar.
 
 ## Stack
 
-- Next.js 16 (App Router)
+- Next.js 16 (App Router, `output: "export"`)
 - React 19
 - TypeScript
 - Tailwind CSS v4
@@ -16,54 +16,29 @@ The frontend is a Next.js app that currently provides a local-first Kanban board
 - Vitest + Testing Library for unit/integration tests
 - Playwright for end-to-end tests
 
-## Current Structure
+## Structure
 
-- `src/app/page.tsx`
-- Renders the `KanbanBoard` component at `/`.
-- `src/components/KanbanBoard.tsx`
-- Main stateful board component.
-- Handles card drag/drop, column renaming, add card, and delete card.
-- Uses in-memory React state initialized from `src/lib/kanban.ts`.
-- `src/components/KanbanColumn.tsx`
-- Column UI and actions (rename, add card, list cards).
-- `src/components/KanbanCard.tsx`
-- Individual card rendering and delete action.
-- `src/components/KanbanCardPreview.tsx`
-- Drag overlay preview content while dragging.
-- `src/components/NewCardForm.tsx`
-- Inline form for adding a card to a column.
-- `src/lib/kanban.ts`
-- Board types, initial seed data, card movement algorithm, id generation.
+- `src/components/KanbanBoard.tsx`: stateful root. Handles the login gate (`localStorage` flag), loading the board from `/api/board`, saving changes, and the chat wiring.
+- `src/components/KanbanColumn.tsx`: column UI. The title is saved on blur or Enter, not per keystroke.
+- `src/components/KanbanCard.tsx`: card display, inline edit (title and details), delete.
+- `src/components/NewCardForm.tsx`: inline add-card form.
+- `src/components/AIChatSidebar.tsx`: chat UI.
+- `src/lib/kanban.ts`: board types, card move algorithm, id generation.
+- `src/test/`: test setup, seed board fixture (mirrors the backend `DEFAULT_BOARD`), fake API for unit tests.
 
-## Behavior Today
+## Behavior
 
-- Exactly five columns are seeded in initial data.
-- Columns can be renamed inline.
-- Cards can be:
-- Added to a column
-- Deleted from a column
-- Reordered in the same column
-- Moved across columns via drag/drop
-- State is not persisted across page reloads.
+- Every board change updates local state, then saves the whole board with `PUT /api/board` and the last known `revision`.
+- Saves run one at a time. Changes made while a save is in flight are sent when it completes, with the new revision.
+- On 409 the board is reloaded and a message is shown.
+- If the board fails to load, an error with a Retry button is shown. There is no offline mode.
+- Chat waits for pending saves, then sends the message and prior history. If the AI changed the board, the returned board and revision replace local state. Server error details are shown in the sidebar.
 
-## Styling Notes
+## Tests
 
-- Global theme variables are in `src/app/globals.css`.
-- Colors match project palette from root `AGENTS.md`.
-- The board uses decorative radial backgrounds and card-based UI surfaces.
-
-## Test Coverage Today
-
-- Unit/integration tests:
-- `src/components/KanbanBoard.test.tsx`
-- `src/lib/kanban.test.ts`
-- End-to-end tests:
-- `tests/kanban.spec.ts`
-
-Current e2e scenarios validate:
-- Board renders at `/` with five columns
-- Adding a card in a column
-- Dragging a card between columns
+- Unit (`npm run test:unit`): `src/components/KanbanBoard.test.tsx` (uses `src/test/fakeApi.ts`) and `src/lib/kanban.test.ts`.
+- E2E against the dev server (`npm run test:e2e`): `tests/kanban.spec.ts`, with the API mocked by `tests/mockBackend.ts`.
+- E2E against the Docker app on :8000 (`npm run test:e2e:integrated`): `tests/kanban.integrated.spec.ts`. The AI test calls OpenRouter and is skipped when it is unreachable.
 
 ## Commands
 
@@ -72,20 +47,13 @@ Run from `frontend/`:
 - Install: `npm install`
 - Dev server: `npm run dev`
 - Build: `npm run build`
+- Lint: `npm run lint`
 - Unit tests: `npm run test:unit`
 - E2E tests: `npm run test:e2e`
-- All tests: `npm run test:all`
+- Integrated E2E: `npm run test:e2e:integrated`
 
-## Conventions For Upcoming Work
+## Conventions
 
-- Keep UI behavior backward compatible unless the active phase explicitly changes it.
-- Prefer focused tests for user-visible behavior over internal implementation assertions.
-- Keep component responsibilities narrow: board-level state in `KanbanBoard`, presentational logic in smaller components.
-- Avoid introducing global state libraries unless there is a proven need.
-- Preserve existing accessibility labels and `data-testid` patterns used by tests.
-
-## Expected Next Integrations
-
-- Part 4: login gating before board render.
-- Part 7: replace in-memory board state with backend API-backed state.
-- Part 10: add an AI sidebar that can trigger board refresh from backend responses.
+- Keep component responsibilities narrow: board state in `KanbanBoard`, presentation in smaller components.
+- Avoid global state libraries unless there is a proven need.
+- Preserve the existing accessibility labels and `data-testid` patterns used by tests.

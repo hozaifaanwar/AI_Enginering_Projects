@@ -16,14 +16,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-COPY backend/pyproject.toml backend/pyproject.toml
-RUN uv sync --project backend --no-dev
+COPY backend/pyproject.toml backend/uv.lock backend/
+RUN uv sync --project backend --locked --no-dev
 
 COPY backend backend
 COPY --from=frontend-builder /app/frontend/out frontend/out
 
 EXPOSE 8000
 
-CMD ["uv", "run", "--project", "backend", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--project", "backend", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

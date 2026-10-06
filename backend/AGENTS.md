@@ -1,26 +1,26 @@
 # Backend Agent Guide
 
-This folder contains the FastAPI backend for the Project Management MVP.
+FastAPI backend for the Project Management MVP. Everything lives in `app/main.py`.
 
-## Current Scope (Part 2)
+## Routes
 
-- Provides a minimal scaffold to validate local Docker execution.
-- Exposes:
-- `GET /` returning temporary hello-world HTML.
-- `GET /api/health` returning JSON service status.
+- `GET /api/health`: status payload (no auth).
+- `GET /api/board`, `PUT /api/board`: read or replace the board. Writes take the client's last `revision`; a mismatch returns 409.
+- `POST /api/board/operations`: apply typed operations (rename column, add/update/delete/move card).
+- `POST /api/ai/chat`: send the board, message and history to OpenRouter, apply the returned operations, and return the reply plus the updated board.
+- `POST /api/ai/ping`: OpenRouter connectivity check.
+- `/`: the static frontend build (`/app/frontend/out`), or a placeholder page if it is missing.
 
-## File Layout
+## Key Behavior
 
-- `app/main.py`: FastAPI app and routes.
-- `tests/test_main.py`: route smoke tests with FastAPI TestClient.
-- `pyproject.toml`: Python dependencies and dev dependencies.
+- Auth: `current_user` checks the `X-Demo-User` / `X-Demo-Password` headers and returns the username. Routes use only that username.
+- Persistence: SQLite at `PM_DB_PATH` (default `backend/data/pm.sqlite`). The MVP user and board are seeded at startup. See `docs/DATABASE_SCHEMA.md`.
+- AI: structured output via a strict JSON schema with one definition per operation. The output is validated with `AIChatLLMOutput`; invalid output or operations return 502. Requests route only to providers that honor `response_format`. DeepInfra is excluded because it often ignores the schema.
+- No DB connection is held during the LLM call.
 
-## Runtime Approach
+## Commands
 
-- Intended to run inside Docker.
-- Uses `uv` in container to manage and execute dependencies.
+Run from `backend/`:
 
-## Next Planned Changes
-
-- Part 3 will replace temporary HTML at `/` by serving the frontend build.
-- Part 6 will add data persistence routes and DB initialization.
+- Tests: `uv run python -m pytest -q`
+- Single test: `uv run python -m pytest tests/test_main.py::test_health_route`
