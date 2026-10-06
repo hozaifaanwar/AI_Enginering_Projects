@@ -23,13 +23,6 @@ const DEMO_AUTH_HEADERS = {
   "X-Demo-User": MVP_USERNAME,
   "X-Demo-Password": MVP_PASSWORD,
 };
-const INITIAL_CHAT_MESSAGES: ChatMessage[] = [
-  {
-    role: "assistant",
-    content: "I can summarize progress and update cards when you ask.",
-  },
-];
-
 type BoardPayload = { board: BoardData; revision: number };
 
 const apiFetch = (path: string, init?: RequestInit) =>
@@ -55,7 +48,7 @@ export const KanbanBoard = () => {
   const [password, setPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [syncMessage, setSyncMessage] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatError, setChatError] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
   const revisionRef = useRef(0);
@@ -262,7 +255,7 @@ export const KanbanBoard = () => {
     setAuthError("");
     setSyncMessage("");
     setChatError("");
-    setChatMessages(INITIAL_CHAT_MESSAGES);
+    setChatMessages([]);
   };
 
   if (!isAuthReady) {

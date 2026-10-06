@@ -7,6 +7,12 @@ export type ChatMessage = {
   content: string;
 };
 
+// Display only; not part of the history sent to the AI.
+const GREETING: ChatMessage = {
+  role: "assistant",
+  content: "I can summarize progress and update cards when you ask.",
+};
+
 type AIChatSidebarProps = {
   messages: ChatMessage[];
   isLoading: boolean;
@@ -45,7 +51,7 @@ export const AIChatSidebar = ({
       </p>
 
       <div className="mt-5 grid max-h-[420px] gap-3 overflow-y-auto rounded-2xl border border-[var(--stroke)] bg-[var(--surface)] p-4">
-        {messages.map((message, index) => (
+        {[GREETING, ...messages].map((message, index) => (
           <div
             key={`${message.role}-${index}`}
             className={`rounded-xl px-3 py-2 text-sm leading-6 ${

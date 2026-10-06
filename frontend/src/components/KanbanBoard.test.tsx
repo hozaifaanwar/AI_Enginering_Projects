@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { KanbanBoard } from "@/components/KanbanBoard";
+import type { ChatMessage } from "@/components/AIChatSidebar";
 import { installFakeApi } from "@/test/fakeApi";
 
 const login = async () => {
@@ -118,8 +119,10 @@ describe("KanbanBoard", () => {
   });
 
   it("applies AI board updates and shows AI error details", async () => {
+    const histories: ChatMessage[][] = [];
     installFakeApi({
-      chat: ({ message }, state) => {
+      chat: ({ message, history }, state) => {
+        histories.push(history);
         if (message === "break") {
           return { status: 502, body: { detail: "AI proposed an invalid change." } };
         }
@@ -148,6 +151,12 @@ describe("KanbanBoard", () => {
     await userEvent.type(textbox, "break");
     await userEvent.click(screen.getByRole("button", { name: /send to ai/i }));
     expect(await screen.findByText(/AI proposed an invalid change/)).toBeInTheDocument();
+    // The greeting is display only; history holds just the prior exchange.
+    expect(histories[0]).toEqual([]);
+    expect(histories[1]).toEqual([
+      { role: "user", content: "rename" },
+      { role: "assistant", content: "Renamed it." },
+    ]);
   });
 
   it("allows logout", async () => {

@@ -73,7 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_boards_user_id ON boards(user_id);
 On startup:
 
 1. Create the database file and directory if missing.
-2. Execute `CREATE TABLE IF NOT EXISTS` statements, and add the `revision` column to older databases.
+2. Execute `CREATE TABLE IF NOT EXISTS` statements.
 3. Ensure the MVP user row and its board exist, seeding the board from the default data.
 
 Read paths never write.

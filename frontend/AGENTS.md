@@ -24,7 +24,7 @@ A Next.js app, exported as static files and served by the FastAPI backend. It sh
 - `src/components/NewCardForm.tsx`: inline add-card form.
 - `src/components/AIChatSidebar.tsx`: chat UI.
 - `src/lib/kanban.ts`: board types, card move algorithm, id generation.
-- `src/test/`: test setup, seed board fixture (mirrors the backend `DEFAULT_BOARD`), fake API for unit tests.
+- `src/test/`: test setup, seed board fixture (mirrors `backend/app/default_board.json`), fake API for unit tests.
 
 ## Behavior
 

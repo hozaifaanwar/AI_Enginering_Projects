@@ -197,7 +197,7 @@ In priority order:
 - [x] M6: Extract a single OpenRouter call helper
 - [x] M7: Mock `fetch` in unit tests; cover saves, 409 handling and editing
 - [x] M8: Update `DATABASE_SCHEMA.md` and the `AGENTS.md` files (the PLAN approval gates still need explicit user sign-off)
-- [ ] L1-L7: Ignore rules, pytest config, defensive code cleanup, chat history, title validation, versions
+- [x] L1-L6: Ignore rules, pytest config, defensive code cleanup, chat history, title validation, versions (L7 is a documented MVP limitation, no action)
 
 ## Remediation Notes (2026-10-04)
 
@@ -209,3 +209,13 @@ In priority order:
 - H5: Full per-operation strict schema and a system prompt that lists the operations. Output is validated directly with `AIChatLLMOutput`. The regex fallback and normalizers are removed.
 - H5 follow-up: a probe of 30 live calls found schema violations only from the DeepInfra provider (3 of 5 calls returned prose instead of schema JSON). The other providers returned valid output on all 25 of their calls. DeepInfra is now excluded via OpenRouter provider preferences.
 - The integrated AI test uses a short title: the model rewrote a 13-digit title as "AI Integrated 1793...".
+
+## Cleanup Notes (2026-10-06)
+
+- L1: `.gitignore` uses forward slashes and ignores `frontend/test-results/`, `frontend/playwright-report/` and `backend/data/`. The Codacy instructions file and test results are untracked.
+- L2: `pythonpath = ["."]` in `backend/pyproject.toml`, so `uv run pytest` works. The Starlette `httpx` deprecation warning remains; it comes from the test client dependency, not app code.
+- L3: Removed the unreachable "Unknown operation type" branch. The board logic raises `ValueError`, which routes map to 404 (operations endpoint) or 502 (AI chat).
+- L4: The chat greeting is display only and is not sent as history. The server sends at most the last 20 history messages.
+- L5: Column and card titles require at least one character.
+- L6: Python 3.14 (Dockerfile, `requires-python`, `uv.lock`); `@types/node` ^22 to match Node 22. The vitest globals are now declared, so `tsc --noEmit` reports 0 errors.
+- `main.py`: 4-space indentation, a `match` statement for operations, the seed board moved to `app/default_board.json`, the model fixed as `OPENROUTER_MODEL` per AGENTS.md, the old `revision` migration removed, and `ruff check` clean.

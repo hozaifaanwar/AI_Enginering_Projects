@@ -22,5 +22,6 @@ FastAPI backend for the Project Management MVP. Everything lives in `app/main.py
 
 Run from `backend/`:
 
-- Tests: `uv run python -m pytest -q`
-- Single test: `uv run python -m pytest tests/test_main.py::test_health_route`
+- Tests: `uv run pytest -q`
+- Single test: `uv run pytest tests/test_main.py::test_health_route`
+- Lint: `uvx ruff check app tests`

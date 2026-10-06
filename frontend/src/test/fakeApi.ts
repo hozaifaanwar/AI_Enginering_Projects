@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import type { ChatMessage } from "@/components/AIChatSidebar";
 import type { BoardData } from "@/lib/kanban";
 import { seedBoard } from "@/test/boardFixture";
 
@@ -13,7 +14,7 @@ export type FakeApiState = {
 type FakeApiOptions = {
   loadStatus?: number;
   putDelayMs?: number;
-  chat?: (body: { message: string }, state: FakeApiState) => FakeResponse;
+  chat?: (body: { message: string; history: ChatMessage[] }, state: FakeApiState) => FakeResponse;
 };
 
 const toResponse = ({ status, body }: FakeResponse) =>

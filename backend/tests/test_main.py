@@ -8,13 +8,13 @@ from fastapi.testclient import TestClient
 
 from app.main import (
     AIChatLLMOutput,
+    AIConversationMessage,
     AIPingResponse,
     BoardDataModel,
     create_app,
     request_openrouter_kanban_response,
     save_board,
 )
-
 
 AUTH_HEADERS = {
     "X-Demo-User": "user",
@@ -357,12 +357,36 @@ def test_kanban_response_is_validated_against_schema() -> None:
         '{"assistantResponse": "Added.", "operations": '
         '[{"type": "add_card", "columnId": "col-a", "title": "T", "details": "D"}]}'
     )
-    with patch("app.main.call_openrouter", return_value=("model", valid)):
+    with patch("app.main.call_openrouter", return_value=valid):
         output = request_openrouter_kanban_response(board, "add", [])
     assert output.operations[0].title == "T"
 
     invalid = '{"assistantResponse": "Added.", "operations": [{"type": "add_card"}]}'
-    with patch("app.main.call_openrouter", return_value=("model", invalid)):
-        with pytest.raises(HTTPException) as error:
-            request_openrouter_kanban_response(board, "add", [])
+    with (
+        patch("app.main.call_openrouter", return_value=invalid),
+        pytest.raises(HTTPException) as error,
+    ):
+        request_openrouter_kanban_response(board, "add", [])
     assert error.value.status_code == 502
+
+
+def test_empty_titles_rejected(client: TestClient) -> None:
+    response = client.post(
+        "/api/board/operations",
+        json={"operations": [{"type": "rename_column", "columnId": "col-backlog", "title": ""}]},
+    )
+    assert response.status_code == 422
+
+
+def test_kanban_request_sends_only_recent_history() -> None:
+    board = BoardDataModel.model_validate({"columns": [], "cards": {}})
+    history = [{"role": "user", "content": f"message {i}"} for i in range(30)]
+    reply = '{"assistantResponse": "Hi.", "operations": []}'
+    with patch("app.main.call_openrouter", return_value=reply) as call:
+        request_openrouter_kanban_response(
+            board, "hello", [AIConversationMessage.model_validate(m) for m in history]
+        )
+    sent = call.call_args.args[0]
+    # System prompt, the last 20 history messages, then the new message.
+    assert len(sent) == 22
+    assert sent[1]["content"] == "message 10"

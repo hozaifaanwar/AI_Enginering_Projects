@@ -1,6 +1,6 @@
 import type { BoardData } from "@/lib/kanban";
 
-// Mirrors DEFAULT_BOARD in backend/app/main.py.
+// Mirrors backend/app/default_board.json.
 export const seedBoard: BoardData = {
   columns: [
     { id: "col-backlog", title: "Backlog", cardIds: ["card-1", "card-2"] },

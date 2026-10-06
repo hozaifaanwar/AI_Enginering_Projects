@@ -174,7 +174,10 @@ cython_debug/
 
 .DS_Store
 
+# Ignore vscode AI rules
+.github/instructions/codacy.instructions.md
 
-
-#Ignore vscode AI rules
-.github\instructions\codacy.instructions.md
+# Test output and local data
+frontend/test-results/
+frontend/playwright-report/
+backend/data/
