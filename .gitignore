@@ -178,6 +178,6 @@ cython_debug/
 .github/instructions/codacy.instructions.md
 
 # Test output and local data
-frontend/test-results/
-frontend/playwright-report/
-backend/data/
+pm/frontend/test-results/
+pm/frontend/playwright-report/
+pm/backend/data/
